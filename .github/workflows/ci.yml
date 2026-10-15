@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install tools
+        run: python -m pip install --upgrade pip yt-dlp
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: CLI smoke tests
+        run: |
+          python grdl.py --help > /dev/null
+          python grdl.py doctor --json | python -c "import json,sys; d=json.load(sys.stdin); assert d['event']=='doctor'; print('doctor ok:', d['ok'])"
+          python grdl.py dl --dry-run https://example.com/v | python -c "import json,sys; [json.loads(l) for l in sys.stdin]; print('dry-run ok')"
+          bash -n install.sh
+          python -m py_compile grdl.py

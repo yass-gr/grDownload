@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "grdownload"
+version = "1.0.0"
+description = "Agent-first video & music downloader built on yt-dlp: fast, no-limit defaults, JSON-native"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Yassine Grairi" }]
+keywords = ["yt-dlp", "downloader", "video", "music", "cli", "agents", "json", "aria2"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Multimedia :: Video",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = ["yt-dlp>=2024.8.6"]
+
+[project.urls]
+Homepage = "https://github.com/yass-gr/grDownload"
+Repository = "https://github.com/yass-gr/grDownload"
+Issues = "https://github.com/yass-gr/grDownload/issues"
+
+[project.scripts]
+grdl = "grdl:main"
+grDownload = "grdl:main"
+
+[tool.setuptools]
+py-modules = ["grdl"]
