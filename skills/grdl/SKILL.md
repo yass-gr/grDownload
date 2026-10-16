@@ -52,7 +52,9 @@ exact yt-dlp command) · `--force` (overwrite).
 ## Rules
 
 - Never expect prompts; the CLI is non-interactive by design.
+- YouTube bot checks are handled automatically with a no-cookie fallback ladder
+  (`fallback` events); don't add cookie or proxy workarounds unless the user asks.
 - Don't retry a failed URL unchanged: 403/410 → `grdl update`; age/members gate →
-  `--cookies-from-browser`; region block → `--proxy`.
+  ask the user before using `--cookies-from-browser`; region block → `--proxy`.
 - Don't bypass DRM or authentication.
 - Prefer `--dir` when the destination matters.

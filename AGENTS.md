@@ -22,6 +22,10 @@ Designed to be driven by agents: no prompts, no TTY requirements, no state.
 - Exit 1 = something failed or is partial (`done.ok == false`, `done.partial == true`).
   Read the `error`/`done.errors` messages before retrying.
 - Exit 2 = bad usage (e.g. no URLs). Exit 130 = interrupted.
+- YouTube bot checks ("Sign in to confirm you're not a bot") are handled automatically
+  by a no-cookie fallback ladder — watch `fallback` events; `done.attempts` shows how
+  many attempts were used. grdl never reads browser cookies by itself; don't add
+  cookie workarounds unless the user explicitly asks.
 - `progress` events are advisory: with aria2c there may be only one per file. Never
   treat missing progress as a hang; use `done`/`summary` as ground truth.
 
@@ -31,6 +35,8 @@ Designed to be driven by agents: no prompts, no TTY requirements, no state.
 - `--dry-run` — emit the exact yt-dlp command; show it to the user if they want proof.
 - `--single` — collapse playlists to one video when the user asked for "this video".
 - `--quality 1080|720|...`, `--compat` (universal mp4), `--audio-format mp3|m4a|flac`.
+- `--no-fallback` — single attempt per URL (strict one-shot behavior).
+- `--impersonate chrome` — TLS fingerprint impersonation (needs curl_cffi).
 - `--cookies-from-browser chrome` — for media the user's own browser session can see.
 - `--proxy URL` — when direct egress fails.
 
@@ -38,8 +44,9 @@ Designed to be driven by agents: no prompts, no TTY requirements, no state.
 
 - DO set `--dir` when the user cares where files go.
 - DO prefer `grdl info --json` over scraping pages for metadata.
-- DON'T loop-retry a failing URL with identical flags; read the error first
-  (403 → `grdl update`; age-gate → cookies; region → `--proxy`).
+- DON'T loop-retry a failing URL with identical flags; the bot-check ladder already
+  retries. Read the error first (403 → `grdl update`; age-gate → ask the user before
+  using cookies; region → `--proxy`).
 - DON'T attempt to bypass DRM or authentication; use the user's own session cookies.
 - DON'T parse `--human` output; use JSON mode (the default when piped).
 

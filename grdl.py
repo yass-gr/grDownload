@@ -38,7 +38,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 REPO_URL = "https://github.com/yass-gr/grDownload"
 
 # Unit separator: JSON-encoded template values escape control characters, so a
@@ -327,6 +327,78 @@ def sort_spec(o) -> str:
     return "res,vcodec:h264,acodec:m4a,br"
 
 
+# ---------------------------------------------------------------------------
+# cookie-free fallback ladder (YouTube bot checks and friends)
+# ---------------------------------------------------------------------------
+
+URL_YOUTUBE_RE = re.compile(
+    r"^https?://(?:[\w-]+\.)*(?:youtube\.com|youtu\.be|youtube-nocookie\.com)/", re.I)
+FALLBACK_TRIGGER_RE = re.compile(
+    r"sign in to confirm|not a bot|page needs to be reloaded|"
+    r"no video formats found|unable to extract|"
+    r"failed to extract any player response|http error 403",
+    re.I)
+YOUTUBE_ALT_CLIENTS = "youtube:player_client=default,tv,mweb"
+
+_IMPERSONATE_CACHE = None
+
+
+def is_youtube_url(url: str) -> bool:
+    return bool(URL_YOUTUBE_RE.match(url or ""))
+
+
+def impersonate_targets(refresh: bool = False):
+    """(client, os, source) impersonation targets supported by the yt-dlp in use."""
+    global _IMPERSONATE_CACHE
+    if _IMPERSONATE_CACHE is not None and not refresh:
+        return _IMPERSONATE_CACHE
+    targets = []
+    if YTDLP:
+        try:
+            code, out, _ = run_capture(
+                list(YTDLP) + ["--ignore-config", "--list-impersonate-targets"])
+            if code == 0:
+                for line in out.splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3 and parts[-1] == "curl_cffi":
+                        targets.append(tuple(parts[:3]))
+        except Exception:
+            pass
+    _IMPERSONATE_CACHE = targets
+    return targets
+
+
+def impersonate_default_target():
+    targets = impersonate_targets()
+    for client, _os, _src in targets:
+        if client.lower().startswith("chrome"):
+            return "chrome"
+    return targets[0][0] if targets else None
+
+
+def build_fallback_ladder(o, url):
+    """Ordered (strategy, extra_args, pause_seconds) attempts for one URL.
+
+    Triggered when a YouTube attempt fails in a recognizable bot-check way.
+    Deliberately cookie-free: alternate player clients, then TLS impersonation
+    (when curl_cffi is available), then one plain retry for transient checks.
+    Disable with --no-fallback / GRDL_NO_FALLBACK=1.
+    """
+    ladder = [("default", [], 0.0)]
+    if o.no_fallback or not is_youtube_url(url):
+        return ladder
+    user_youtube_args = any("youtube:" in str(a) for a in (o.extractor_args or []))
+    alt = [] if user_youtube_args else ["--extractor-args", YOUTUBE_ALT_CLIENTS]
+    if alt:
+        ladder.append(("alt-player-clients", alt, 1.5))
+    if not o.impersonate:
+        target = impersonate_default_target()
+        if target:
+            ladder.append(("tls-impersonate", ["--impersonate", target] + alt, 1.5))
+    ladder.append(("retry", [], 4.0))
+    return ladder
+
+
 def yt_common_args(o) -> list:
     args = [
         "--ignore-config",
@@ -371,10 +443,14 @@ def yt_common_args(o) -> list:
         args += ["--cookies", o.cookies]
     if o.proxy:
         args += ["--proxy", o.proxy]
+    if o.impersonate:
+        args += ["--impersonate", o.impersonate]
+    for ea in (o.extractor_args or []):
+        args += ["--extractor-args", ea]
     return args
 
 
-def build_download_argv(o, url: str, mode: str = "video") -> list:
+def build_download_argv(o, url: str, mode: str = "video", extra_args=None) -> list:
     args = list(YTDLP or []) + yt_common_args(o) + ["-i"]
     if o.single:
         args.append("--no-playlist")
@@ -394,6 +470,8 @@ def build_download_argv(o, url: str, mode: str = "video") -> list:
         if o.subs:
             args += ["--write-subs", "--write-auto-subs",
                      "--sub-langs", o.subs, "--embed-subs"]
+    if extra_args:
+        args += list(extra_args)
     args.append(url)
     return args
 
@@ -482,8 +560,8 @@ def filesize(path: str):
 # download engine
 # ---------------------------------------------------------------------------
 
-def run_one(o, url: str, idx: int, total: int, allow_live: bool) -> dict:
-    started = time.time()
+def _attempt(o, url, idx, total, allow_live, extra_args, strategy, attempt_no):
+    """Run yt-dlp once for one URL; returns the per-attempt state dict."""
     state = {
         "url": url,
         "idx": idx,
@@ -497,10 +575,14 @@ def run_one(o, url: str, idx: int, total: int, allow_live: bool) -> dict:
         "speed": None,
         "label": url if len(url) < 70 else url[:67] + "...",
         "live": allow_live and not OUT.json,
+        "strategy": strategy,
+        "rc": 0,
+        "triggered": False,
     }
-    args = build_download_argv(o, url, mode="audio" if o.command == "audio" else "video")
-    OUT.event("start", url=url, index=idx, total=total, cmd=shlex.join(args),
-              dir=str(o.dir), mode=o.command)
+    mode = "audio" if o.command == "audio" else "video"
+    args = build_download_argv(o, url, mode=mode, extra_args=extra_args)
+    OUT.event("start", url=url, index=idx, total=total, attempt=attempt_no,
+              strategy=strategy, cmd=shlex.join(args), dir=str(o.dir), mode=o.command)
 
     def add_file(path, cached=False):
         if not path or path in state["seen"]:
@@ -573,11 +655,38 @@ def run_one(o, url: str, idx: int, total: int, allow_live: bool) -> dict:
                 OUT.human("· " + line)
 
     rc = run_streaming(args, on_line)
+    state["rc"] = rc
+    state["triggered"] = any(FALLBACK_TRIGGER_RE.search(l) for l in state["errors"])
 
     if not state["files"] and rc == 0 and not state["errors"] and state["meta"]:
         for path in existing_files(o.dir, state["meta"].get("id")):
             add_file(path, cached=True)
+    return state
 
+
+def run_one(o, url: str, idx: int, total: int, allow_live: bool) -> dict:
+    started = time.time()
+    ladder = build_fallback_ladder(o, url)
+    state = None
+    attempts_used = 0
+    for attempt_no, (strategy, extra, pause) in enumerate(ladder, 1):
+        if attempt_no > 1:
+            if pause:
+                time.sleep(pause)
+            reason = ""
+            if state:
+                pool = state["errors"] or list(state["tail"])
+                reason = (pool[-1][:200] if pool else "")
+            OUT.event("fallback", url=url, attempt=attempt_no,
+                      max_attempts=len(ladder), strategy=strategy, reason=reason)
+            OUT.human(f"↻ {state['label'] if state else url} — retrying with "
+                      f"{strategy} ({attempt_no}/{len(ladder)})", err=True)
+        state = _attempt(o, url, idx, total, allow_live, extra, strategy, attempt_no)
+        attempts_used = attempt_no
+        if state["files"] or not state["triggered"]:
+            break
+
+    rc = state["rc"]
     files = state["files"]
     cached = bool(files) and not state["progress_seen"]
     if not files:
@@ -595,16 +704,18 @@ def run_one(o, url: str, idx: int, total: int, allow_live: bool) -> dict:
         "cached": cached,
         "files": files,
         "errors": state["errors"][:3],
+        "attempts": attempts_used,
         "elapsed": elapsed,
     }
     if not ok and not files:
         first = state["errors"][0] if state["errors"] else \
             (state["tail"][-1] if state["tail"] else f"yt-dlp exited with code {rc}")
-        OUT.event("error", url=url, message=first, exit=rc)
+        OUT.event("error", url=url, message=first, exit=rc, attempts=attempts_used)
         OUT.human(f"✘ {url}: {first}", err=True)
     OUT.end_progress()
     OUT.event("done", url=url, ok=ok, partial=partial, cached=cached,
-              files=files, errors=state["errors"][:3], exit=rc, elapsed=elapsed)
+              files=files, errors=state["errors"][:3], exit=rc,
+              attempts=attempts_used, elapsed=elapsed)
     return result
 
 
@@ -884,8 +995,27 @@ def doctor_report() -> dict:
         rep["hints"].append("optional: install aria2 for faster multi-connection downloads:  grdl setup")
     if not rep["dir_writable"]:
         rep["hints"].append(f"download dir is not writable: {rep['dir']}")
+    imp = impersonate_targets()
+    rep["impersonate"] = {"available": bool(imp),
+                          "targets": [f"{c} ({os_name})" for c, os_name, _s in imp][:4]}
+    rep["pot_provider"] = pot_provider_present()
+    if not imp:
+        rep["hints"].append("optional: TLS impersonation fallback for stubborn sites — "
+                            "run: grdl setup --impersonate")
     rep["ok"] = bool(rep["yt_dlp"]["found"] and rep["ffmpeg"]["found"] and rep["dir_writable"])
     return rep
+
+
+def pot_provider_present() -> bool:
+    for base in (Path.home() / ".config" / "yt-dlp" / "plugins",
+                 Path.home() / ".local" / "share" / "yt-dlp" / "plugins",
+                 Path("/etc/yt-dlp/plugins")):
+        try:
+            if base.is_dir() and any("pot" in c.name.lower() for c in base.iterdir()):
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def cmd_doctor(o, ns) -> int:
@@ -900,6 +1030,11 @@ def cmd_doctor(o, ns) -> int:
                   f"{rep['ffmpeg']['version'] or 'not found'}")
         OUT.human(f"{mark(rep['aria2']['found'] or True)} aria2    "
                   f"{rep['aria2']['version'] or 'not found (optional)'}")
+        imp = rep["impersonate"]
+        imp_label = imp["targets"][0] if imp["targets"] else "available"
+        OUT.human(f"{'✔' if imp['available'] else '·'} fallback  impersonate: "
+                  f"{imp_label if imp['available'] else 'unavailable (grdl setup --impersonate)'}"
+                  f" · pot-provider: {'yes' if rep['pot_provider'] else 'no'}")
         OUT.human(f"{mark(rep['dir_writable'])} dir      {rep['dir']}")
         for hint in rep["hints"]:
             OUT.human("  → " + hint)
@@ -967,7 +1102,9 @@ def cmd_setup(o, ns) -> int:
         needs.append("ffmpeg")
     if not rep["aria2"]["found"]:
         needs.append("aria2")
-    if not needs:
+    want_imp = bool(getattr(ns, "impersonate", False))
+    imp_missing = want_imp and not rep["impersonate"]["available"]
+    if not needs and not imp_missing:
         OUT.event("setup", status="already-installed", ok=True)
         OUT.human("Everything is already installed. Nothing to do.")
         return 0
@@ -995,9 +1132,38 @@ def cmd_setup(o, ns) -> int:
             OUT.event("setup", tool=tool, action="failed", ok=False)
             OUT.human(f"✘ could not install {tool}; install it manually", err=True)
 
+    imp_cands = []
+    if imp_missing:
+        uv = which("uv")
+        if uv:
+            imp_cands.append(([uv, "pip", "install", "--python", sys.executable,
+                               "--break-system-packages", "curl_cffi"], True))
+        imp_cands.append(([sys.executable, "-m", "pip", "install",
+                           "--break-system-packages", "curl_cffi"], True))
+
     if dry:
+        if imp_missing:
+            OUT.human("curl_cffi: would try:")
+            for argv, _use_sudo in imp_cands:
+                OUT.human("  " + shlex.join(argv))
         OUT.event("setup", status="plan", ok=None)
         return 0
+
+    if imp_missing:
+        installed_imp = False
+        for argv, use_sudo in imp_cands:
+            ok, why = run_installer(argv, use_sudo)
+            OUT.event("setup", tool="curl_cffi", action="try",
+                      cmd=shlex.join(argv), ok=ok, message=why or None)
+            if ok:
+                OUT.human("✔ installed curl_cffi (TLS impersonation fallback)")
+                installed_imp = True
+                break
+            OUT.human(f"  · {shlex.join(argv)} failed: {why}", err=True)
+        if not installed_imp:
+            OUT.human("✘ could not install curl_cffi; impersonation fallback stays off",
+                      err=True)
+        impersonate_targets(refresh=True)
 
     # Re-scan PATH for newly installed binaries.
     YTDLP = resolve_ytdlp()
@@ -1085,6 +1251,9 @@ def resolve_options(ns, command: str):
     o.cookies_from_browser = (getattr(ns, "cookies_from_browser", None)
                               or os.environ.get("GRDL_COOKIES_FROM_BROWSER"))
     o.proxy = getattr(ns, "proxy", None) or os.environ.get("GRDL_PROXY")
+    o.no_fallback = bool(getattr(ns, "no_fallback", False) or env_bool("GRDL_NO_FALLBACK"))
+    o.impersonate = getattr(ns, "impersonate", None) or os.environ.get("GRDL_IMPERSONATE")
+    o.extractor_args = list(getattr(ns, "extractor_args", None) or [])
 
     o.output = (getattr(ns, "output", None) or os.environ.get("GRDL_OUTPUT")
                 or DEFAULT_TEMPLATE)
@@ -1143,7 +1312,7 @@ def collect_urls(o, ns):
     return deduped
 
 
-def add_common(p: argparse.ArgumentParser) -> None:
+def add_common(p: argparse.ArgumentParser, with_impersonate: bool = True) -> None:
     S = argparse.SUPPRESS
     p.add_argument("--json", action="store_true", default=S,
                    help="force NDJSON output on stdout")
@@ -1171,6 +1340,13 @@ def add_common(p: argparse.ArgumentParser) -> None:
                    help="suppress human chatter (errors still shown)")
     p.add_argument("-v", "--verbose", action="store_true", default=S,
                    help="stream raw yt-dlp output")
+    p.add_argument("--no-fallback", action="store_true", default=S,
+                   help="disable the automatic no-cookie retry ladder (bot checks)")
+    if with_impersonate:
+        p.add_argument("--impersonate", default=S, metavar="TARGET",
+                       help="TLS impersonation target, e.g. chrome (needs curl_cffi)")
+    p.add_argument("--extractor-args", action="append", default=S, metavar="ARGS",
+                   help="raw yt-dlp extractor args, e.g. 'youtube:player_client=tv' (repeatable)")
 
 
 def add_urls(p: argparse.ArgumentParser) -> None:
@@ -1256,9 +1432,11 @@ def build_parser() -> argparse.ArgumentParser:
                      help="exit 1 when something is missing")
 
     s = sub.add_parser("setup", help="install missing dependencies")
-    add_common(s)
+    add_common(s, with_impersonate=False)
     s.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
                    help="show the install commands without running them")
+    s.add_argument("--impersonate", action="store_true", default=argparse.SUPPRESS,
+                   help="also install curl_cffi (enables the TLS impersonation fallback)")
 
     u = sub.add_parser("update", help="update yt-dlp to the latest version")
     add_common(u)

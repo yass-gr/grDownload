@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "grdownload"
-version = "1.0.0"
+version = "1.1.0"
 description = "Agent-first video & music downloader built on yt-dlp: fast, no-limit defaults, JSON-native"
 readme = "README.md"
 requires-python = ">=3.9"

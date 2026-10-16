@@ -52,6 +52,9 @@ def mk_opts(**over):
         quiet=False,
         dry_run=False,
         urls=None,
+        no_fallback=False,
+        impersonate=None,
+        extractor_args=[],
     )
     base.update(over)
     return types.SimpleNamespace(**base)
@@ -211,6 +214,63 @@ class TestDataHelpers(unittest.TestCase):
         self.assertEqual(s["files"], ["a", "b"])
         self.assertEqual(s["failed_urls"], ["u2"])
         self.assertEqual(s["partial_urls"], ["u3"])
+
+
+class TestFallbackLadder(unittest.TestCase):
+    def test_youtube_url_detection(self):
+        self.assertTrue(g.is_youtube_url("https://www.youtube.com/watch?v=x"))
+        self.assertTrue(g.is_youtube_url("https://youtu.be/x"))
+        self.assertTrue(g.is_youtube_url("https://music.youtube.com/watch?v=x"))
+        self.assertFalse(g.is_youtube_url("https://vimeo.com/1"))
+        self.assertFalse(g.is_youtube_url("https://notyoutube.com.evil.io/1"))
+
+    def test_bot_check_triggers(self):
+        self.assertTrue(g.FALLBACK_TRIGGER_RE.search(
+            "ERROR: [youtube] x: Sign in to confirm you're not a bot. Use --cookies"))
+        self.assertTrue(g.FALLBACK_TRIGGER_RE.search(
+            "ERROR: [youtube] x: The page needs to be reloaded."))
+        self.assertTrue(g.FALLBACK_TRIGGER_RE.search(
+            "ERROR: [youtube] x: Unable to extract player response"))
+        self.assertFalse(g.FALLBACK_TRIGGER_RE.search("ERROR: Video unavailable"))
+
+    def test_ladder_is_cookie_free(self):
+        with mock.patch.object(g, "impersonate_default_target", return_value="chrome"):
+            ladder = g.build_fallback_ladder(mk_opts(), "https://youtu.be/x")
+        self.assertEqual([s for s, _a, _p in ladder],
+                         ["default", "alt-player-clients", "tls-impersonate", "retry"])
+        for _strategy, extra, _pause in ladder:
+            self.assertFalse(any("cookie" in a.lower() for a in extra))
+        tls = [a for s, a, _p in ladder if s == "tls-impersonate"][0]
+        self.assertIn("--impersonate", tls)
+        self.assertIn("chrome", tls)
+
+    def test_ladder_disabled_flag(self):
+        ladder = g.build_fallback_ladder(mk_opts(no_fallback=True), "https://youtu.be/x")
+        self.assertEqual(len(ladder), 1)
+
+    def test_ladder_skipped_for_other_sites(self):
+        with mock.patch.object(g, "impersonate_default_target", return_value="chrome"):
+            ladder = g.build_fallback_ladder(mk_opts(), "https://vimeo.com/1")
+        self.assertEqual(len(ladder), 1)
+
+    def test_ladder_without_impersonate_support(self):
+        with mock.patch.object(g, "impersonate_default_target", return_value=None):
+            ladder = g.build_fallback_ladder(mk_opts(), "https://youtu.be/x")
+        self.assertEqual([s for s, _a, _p in ladder],
+                         ["default", "alt-player-clients", "retry"])
+
+    def test_ladder_respects_user_client_args(self):
+        o = mk_opts(extractor_args=["youtube:player_client=tv"])
+        with mock.patch.object(g, "impersonate_default_target", return_value="chrome"):
+            ladder = g.build_fallback_ladder(o, "https://youtu.be/x")
+        self.assertEqual([s for s, _a, _p in ladder],
+                         ["default", "tls-impersonate", "retry"])
+
+    def test_extra_args_placed_before_url(self):
+        args = g.build_download_argv(mk_opts(), "https://x.com/v",
+                                     extra_args=["--impersonate", "chrome"])
+        self.assertEqual(args[-3:-1], ["--impersonate", "chrome"])
+        self.assertEqual(args[-1], "https://x.com/v")
 
 
 class TestCliSurface(unittest.TestCase):
